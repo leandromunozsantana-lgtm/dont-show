@@ -104,6 +104,71 @@ _GENERIC_RATE_LIMIT = (
     b'"message":"Rate limited, please retry later."}}'
 )
 
+
+# Map HTTP status -> (anthropic_error_type, openai_error_type, generic_message).
+# Used to rebuild upstream error envelopes in each API's native format so the
+# proxy looks like the real API and not whatever middleware sits behind it.
+_STATUS_TO_ERROR = {
+    400: ("invalid_request_error", "invalid_request_error", "Invalid request"),
+    401: ("authentication_error", "authentication_error", "Authentication failed"),
+    403: ("permission_error", "permission_error", "Forbidden"),
+    404: ("not_found_error", "invalid_request_error", "Not found"),
+    405: ("invalid_request_error", "invalid_request_error", "Method not allowed"),
+    413: ("request_too_large", "invalid_request_error", "Request too large"),
+    422: ("invalid_request_error", "invalid_request_error", "Invalid request"),
+    429: ("rate_limit_error", "rate_limit_error", "Rate limited"),
+    500: ("api_error", "server_error", "Internal server error"),
+    502: ("api_error", "server_error", "Bad gateway"),
+    503: ("api_error", "server_error", "Service unavailable"),
+    529: ("overloaded_error", "server_error", "Overloaded"),
+}
+
+
+def _native_error_body(api: str, status: int, message: str = "") -> bytes:
+    a_type, o_type, default_msg = _STATUS_TO_ERROR.get(
+        status, ("api_error", "server_error", "Request failed")
+    )
+    msg = message or default_msg
+    if api == "ANTHROPIC":
+        return json.dumps({"type": "error", "error": {"type": a_type, "message": msg}}).encode()
+    return json.dumps({"error": {"message": msg, "type": o_type, "param": None, "code": None}}).encode()
+
+
+def _sanitize_error_envelope(api: str, status: int, content_type: str, body: bytes) -> bytes:
+    """Rewrite upstream-middleware error envelopes into the API's native format.
+
+    Catches the two distinctive shapes the upstream middleware emits:
+      {"error":"...","errors":[{"message":"..."}]}        (allowlist rejector)
+      {"message":"...","error":"Bad Request","statusCode":N}  (NestJS exception filter)
+    Anything already in native Anthropic / OpenAI shape is left untouched.
+    """
+    if not body or "application/json" not in (content_type or "").lower():
+        return body
+    try:
+        payload = json.loads(body)
+    except (ValueError, TypeError):
+        return body
+    if not isinstance(payload, dict):
+        return body
+
+    # Already native Anthropic envelope.
+    if payload.get("type") == "error" and isinstance(payload.get("error"), dict):
+        return body
+    # Already native OpenAI envelope (error.message + error.type, no statusCode sibling).
+    err = payload.get("error")
+    if isinstance(err, dict) and "statusCode" not in payload and "errors" not in payload:
+        return body
+
+    is_middleware = (
+        ("errors" in payload and isinstance(payload.get("errors"), list))
+        or ("statusCode" in payload and "message" in payload)
+    )
+    if not is_middleware:
+        return body
+
+    # Discard upstream's wording — use a generic message keyed to status.
+    return _native_error_body(api, status)
+
 # Strict allowlist: only upstream response headers the client legitimately
 # needs are forwarded. Everything else (Skills-Network-*, helmet/Express
 # security headers, Server, Date, Etag, CSP, Cross-Origin-*, etc.) is
@@ -185,6 +250,15 @@ def _unwrap_error_status(status: int, content_type: str, body: bytes) -> int:
         return (OPENAI_ERROR_CODE_STATUS.get(err.get("code") or "")
                 or OPENAI_ERROR_TYPE_STATUS.get(err.get("type") or "")
                 or 500)
+
+    # Upstream middleware envelopes (NestJS-style). Either:
+    #   {"statusCode": N, "message": "...", "error": "..."}
+    #   {"error": "...", "errors": [{"message": "..."}]}
+    sc = payload.get("statusCode")
+    if isinstance(sc, int) and 400 <= sc < 600:
+        return sc
+    if isinstance(payload.get("errors"), list) and "error" in payload:
+        return 404
 
     return status
 
@@ -433,6 +507,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     if status == 429:
                         data = _GENERIC_RATE_LIMIT
                     else:
+                        data = _sanitize_error_envelope(api, status, content_type, data)
                         data = _scrub(data)
 
                     self.send_response(status)
@@ -457,6 +532,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if e.code == 429:
                 data = _GENERIC_RATE_LIMIT
             else:
+                err_ct = e.headers.get("Content-Type", "") if e.headers else ""
+                data = _sanitize_error_envelope(api, e.code, err_ct, data)
                 data = _scrub(data)
             try:
                 self.send_response(e.code)
@@ -475,9 +552,40 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             elapsed = int((time.time() - t0) * 1000)
             print(f"[{ts}] <-- {api:10s} FAILED ({elapsed}ms) {e}", flush=True)
-            self._send_simple(502, json.dumps({"error": "Upstream error", "detail": str(e)}).encode())
+            # Don't leak the upstream exception text — return the API's native
+            # bad-gateway shape with a generic message.
+            self._send_simple(502, _native_error_body(api, 502))
 
     do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = _proxy
+
+    def _send_method_not_allowed(self):
+        # Route-aware native error: pick Anthropic vs OpenAI by path prefix,
+        # falling back to Anthropic shape for non-routed paths.
+        api = "OPENAI" if self.path.startswith("/openai") else "ANTHROPIC"
+        self._send_simple(405, _native_error_body(api, 405))
+
+    do_OPTIONS = _send_method_not_allowed
+    do_HEAD = _send_method_not_allowed
+    do_TRACE = _send_method_not_allowed
+    do_CONNECT = _send_method_not_allowed
+
+    def send_error(self, code, message=None, explain=None):
+        # The default BaseHTTPRequestHandler.send_error emits an HTML page
+        # ("<!DOCTYPE HTML PUBLIC ..."> + Python enum names + stack hints)
+        # which fingerprints the server as Python's stdlib http.server.
+        # Replace it with a JSON body matching whichever API was addressed.
+        api = "OPENAI" if self.path.startswith("/openai") else "ANTHROPIC"
+        body = _native_error_body(api, code)
+        try:
+            self.send_response(code, message)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if self.command != "HEAD" and code >= 200 and code not in (204, 304):
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
 
 if __name__ == "__main__":
