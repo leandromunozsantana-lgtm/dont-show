@@ -6,6 +6,8 @@ import urllib.error
 import ssl
 import os
 import re
+import signal
+import subprocess
 import time
 import json
 import hmac
@@ -103,6 +105,27 @@ _GENERIC_RATE_LIMIT = (
     b'{"type":"error","error":{"type":"rate_limit_error",'
     b'"message":"Rate limited, please retry later."}}'
 )
+
+
+def _ascii_escape_body(body: bytes, content_type: str) -> bytes:
+    """Re-encode JSON request body so any non-ASCII codepoint becomes \\uXXXX.
+
+    Upstream replaces non-ASCII bytes in the request payload with literal '?'
+    before forwarding to the API, which destroys CJK / emoji prompts. JSON's
+    \\uXXXX escape covers every Unicode codepoint and Anthropic / OpenAI's
+    parsers unescape it transparently, so by forcing ensure_ascii=True we
+    pass an equivalent pure-ASCII payload that the upstream filter can't
+    mangle.
+
+    Non-JSON bodies and unparseable JSON pass through untouched.
+    """
+    if not body or "application/json" not in (content_type or "").lower():
+        return body
+    try:
+        payload = json.loads(body)
+    except (ValueError, TypeError):
+        return body
+    return json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii")
 
 
 # Map HTTP status -> (anthropic_error_type, openai_error_type, generic_message).
@@ -450,6 +473,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return
         auth_record_success(ip)
 
+        # Escape any non-ASCII codepoints in the JSON body as \uXXXX so the
+        # upstream's input filter (which replaces non-ASCII bytes with '?')
+        # can't mangle CJK / emoji prompts. Anthropic / OpenAI parse the
+        # escapes back transparently.
+        req_ct = self.headers.get("Content-Type", "")
+        body = _ascii_escape_body(body, req_ct)
+        # Content-Length is excluded from forwarded headers above, urllib
+        # recomputes it from the data payload, so the rewritten size is fine.
+
         req = urllib.request.Request(url, data=body, headers=headers, method=self.command)
         ctx = ssl.create_default_context()
 
@@ -588,6 +620,48 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             pass
 
 
+def _reclaim_port(port: int):
+    """Kill any process currently bound to `port` so we can take over.
+
+    Tries `lsof -ti :PORT` first, falls back to `fuser PORT/tcp`. SIGTERM
+    each victim, give the kernel 0.5s to release the socket, then SIGKILL
+    any survivor. Best-effort — silently no-ops if the binaries aren't
+    available or the process can't be killed (different user, etc).
+    """
+    my_pid = os.getpid()
+    pids: list[int] = []
+    for cmd in (["lsof", "-ti", f":{port}"], ["fuser", f"{port}/tcp"]):
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+        except (FileNotFoundError, subprocess.SubprocessError):
+            continue
+        combined = (res.stdout or "") + " " + (res.stderr or "")
+        for tok in combined.replace("\n", " ").split():
+            if tok.isdigit():
+                pid = int(tok)
+                if pid != my_pid and pid not in pids:
+                    pids.append(pid)
+        if pids:
+            break
+
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    if pids:
+        print(f"[proxy] port {port} was held by {pids} — sent SIGTERM", flush=True)
+        time.sleep(0.5)
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                print(f"[proxy]   pid {pid} did not exit on SIGTERM — SIGKILL", flush=True)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                pass
+
+
 if __name__ == "__main__":
     if not PROXY_API_KEY:
         print("[proxy] WARNING: PROXY_API_KEY not set — tunnel is open to anyone", flush=True)
@@ -596,7 +670,15 @@ if __name__ == "__main__":
 
     # SO_REUSEADDR avoids "Address already in use" right after restart
     http.server.ThreadingHTTPServer.allow_reuse_address = True
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), ProxyHandler)
+    _reclaim_port(PORT)
+    try:
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), ProxyHandler)
+    except OSError as e:
+        # Last-ditch: something else still holds the port. Wait briefly and
+        # retry once; the kernel's TIME_WAIT often clears in <2s with REUSEADDR.
+        print(f"[proxy] bind failed ({e}); retrying after 2s...", flush=True)
+        time.sleep(2)
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), ProxyHandler)
     print(f"[proxy] Listening on http://127.0.0.1:{PORT}", flush=True)
     print(f"[proxy]   max body: {MAX_BODY_BYTES} bytes, upstream timeout: {UPSTREAM_TIMEOUT}s", flush=True)
     for prefix, target in ROUTES.items():
