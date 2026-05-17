@@ -5,6 +5,7 @@ import urllib.request
 import urllib.error
 import ssl
 import os
+import re
 import time
 import json
 import hmac
@@ -82,6 +83,26 @@ ROUTES = {
 }
 
 AUTH_HEADER_NAMES = {"x-api-key", "authorization"}
+
+# Defense in depth: scrub any mention of the internal provider's name from
+# every response body we forward (streaming chunks, buffered bodies, error
+# payloads). Matches `skills-network`, `skills network`, `skills_network`,
+# `skills.network`, `SkillsNetwork`, etc.
+_BRAND_RE = re.compile(rb"skills[\s\-_.]?network", re.IGNORECASE)
+
+
+def _scrub(data: bytes) -> bytes:
+    if not data:
+        return data
+    return _BRAND_RE.sub(b"upstream", data)
+
+
+# Generic 429 body. Sent in place of whatever upstream returned so quota /
+# billing language never reaches the client.
+_GENERIC_RATE_LIMIT = (
+    b'{"type":"error","error":{"type":"rate_limit_error",'
+    b'"message":"Rate limited, please retry later."}}'
+)
 
 # Strict allowlist: only upstream response headers the client legitimately
 # needs are forwarded. Everything else (Skills-Network-*, helmet/Express
@@ -387,12 +408,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             buf.extend(line)
                             # Flush on event boundary (blank line) or when buffer gets large
                             if line in (b"\n", b"\r\n") or len(buf) > 16384:
-                                self._send_chunk(bytes(buf))
-                                bytes_sent += len(buf)
+                                chunk = _scrub(bytes(buf))
+                                self._send_chunk(chunk)
+                                bytes_sent += len(chunk)
                                 buf.clear()
                         if buf:
-                            self._send_chunk(bytes(buf))
-                            bytes_sent += len(buf)
+                            chunk = _scrub(bytes(buf))
+                            self._send_chunk(chunk)
+                            bytes_sent += len(chunk)
                         self.wfile.write(b"0\r\n\r\n")
                         self.wfile.flush()
                     except (BrokenPipeError, ConnectionResetError):
@@ -404,6 +427,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     # when Skills-Network wrapped an error inside a 200.
                     data = resp.read()
                     status = _unwrap_error_status(resp.status, content_type, data)
+
+                    # Replace 429 bodies entirely so quota/billing language
+                    # from upstream never reaches the client.
+                    if status == 429:
+                        data = _GENERIC_RATE_LIMIT
+                    else:
+                        data = _scrub(data)
 
                     self.send_response(status)
                     for k, v in resp.headers.items():
@@ -424,6 +454,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             data = e.read()
             elapsed = int((time.time() - t0) * 1000)
             print(f"[{ts}] <-- {api:10s} {e.code} ERROR ({elapsed}ms) {data[:200]!r}", flush=True)
+            if e.code == 429:
+                data = _GENERIC_RATE_LIMIT
+            else:
+                data = _scrub(data)
             try:
                 self.send_response(e.code)
                 for k, v in e.headers.items():
