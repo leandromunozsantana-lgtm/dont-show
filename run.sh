@@ -78,6 +78,32 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Kill any previous proxy.py / ngrok left running by an earlier shell so
+# that a fresh `run.sh` in a new terminal doesn't collide on the port or
+# trip ngrok free-tier's single-session-per-authtoken limit (ERR_NGROK_108).
+# proxy.py already reclaims its own port, but a half-broken instance not
+# yet bound still needs to be cleared.
+reclaim_previous() {
+  local killed=0
+  if pgrep -f "$ROOT/proxy.py" > /dev/null 2>&1; then
+    pkill -f "$ROOT/proxy.py" 2>/dev/null || true
+    killed=1
+  fi
+  if pgrep -f "$NGROK_BIN http" > /dev/null 2>&1; then
+    pkill -f "$NGROK_BIN http" 2>/dev/null || true
+    killed=1
+  fi
+  if [[ $killed -eq 1 ]]; then
+    echo "[*] Previous proxy/ngrok session killed; waiting for ports to clear..."
+    sleep 1
+    # Force SIGKILL anything that ignored SIGTERM.
+    pkill -9 -f "$ROOT/proxy.py" 2>/dev/null || true
+    pkill -9 -f "$NGROK_BIN http" 2>/dev/null || true
+  fi
+  # Clean stale PID files so is_alive() doesn't get confused.
+  rm -f "$PROXY_PID_FILE" "$NGROK_PID_FILE"
+}
+
 start_proxy() {
   python3 "$ROOT/proxy.py" &
   echo $! > "$PROXY_PID_FILE"
@@ -155,6 +181,7 @@ EOF
 }
 
 # --- Boot ---
+reclaim_previous
 echo "[*] Starting proxy..."
 start_proxy
 if ! wait_for_proxy; then
