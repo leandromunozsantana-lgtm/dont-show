@@ -80,27 +80,46 @@ trap cleanup EXIT INT TERM
 
 # Kill any previous proxy.py / ngrok left running by an earlier shell so
 # that a fresh `run.sh` in a new terminal doesn't collide on the port or
-# trip ngrok free-tier's single-session-per-authtoken limit (ERR_NGROK_108).
-# proxy.py already reclaims its own port, but a half-broken instance not
-# yet bound still needs to be cleared.
+# trip ngrok limits. proxy.py already reclaims its own port; this also
+# covers ngrok which the proxy can't touch.
+#
+# ngrok specifically needs a *graceful* shutdown: a SIGKILL leaves the
+# endpoint published in ngrok cloud for ~60s of heartbeat timeout, and
+# the next `ngrok http` against the same authtoken fails with
+# ERR_NGROK_334 ("endpoint already online"). We send SIGTERM, wait for
+# the process to actually exit (up to NGROK_GRACE seconds), then ping
+# the local agent API as a fallback to force-disconnect from cloud.
+NGROK_GRACE="${NGROK_GRACE:-8}"
+
 reclaim_previous() {
-  local killed=0
+  # Proxy is cheap to kill — port reclaim in proxy.py covers stragglers.
   if pgrep -f "$ROOT/proxy.py" > /dev/null 2>&1; then
     pkill -f "$ROOT/proxy.py" 2>/dev/null || true
-    killed=1
-  fi
-  if pgrep -f "$NGROK_BIN http" > /dev/null 2>&1; then
-    pkill -f "$NGROK_BIN http" 2>/dev/null || true
-    killed=1
-  fi
-  if [[ $killed -eq 1 ]]; then
-    echo "[*] Previous proxy/ngrok session killed; waiting for ports to clear..."
-    sleep 1
-    # Force SIGKILL anything that ignored SIGTERM.
+    sleep 0.3
     pkill -9 -f "$ROOT/proxy.py" 2>/dev/null || true
-    pkill -9 -f "$NGROK_BIN http" 2>/dev/null || true
   fi
-  # Clean stale PID files so is_alive() doesn't get confused.
+
+  # ngrok needs the graceful path.
+  if pgrep -f "$NGROK_BIN http" > /dev/null 2>&1; then
+    echo "[*] Existing ngrok session found; asking it to disconnect cleanly..."
+    # Try the local agent API first — this is the cleanest path because
+    # ngrok sends a proper goodbye to the cloud and the endpoint frees
+    # almost immediately.
+    curl -sf --max-time 2 -X DELETE http://127.0.0.1:4040/api/tunnels > /dev/null 2>&1 || true
+    pkill -TERM -f "$NGROK_BIN http" 2>/dev/null || true
+    # Wait up to NGROK_GRACE seconds for the process to actually exit.
+    for _ in $(seq 1 "$NGROK_GRACE"); do
+      pgrep -f "$NGROK_BIN http" > /dev/null 2>&1 || break
+      sleep 1
+    done
+    # If it's still stuck, force it.
+    if pgrep -f "$NGROK_BIN http" > /dev/null 2>&1; then
+      echo "[!] ngrok did not exit gracefully; sending SIGKILL"
+      pkill -9 -f "$NGROK_BIN http" 2>/dev/null || true
+    fi
+  fi
+
+  # Stale PID files would confuse is_alive() in the watch loop.
   rm -f "$PROXY_PID_FILE" "$NGROK_PID_FILE"
 }
 
@@ -191,8 +210,25 @@ fi
 echo "[*] Proxy ready."
 
 echo "[*] Starting ngrok tunnel..."
-start_ngrok
-URL=$(wait_for_tunnel) || {
+# ngrok cloud can hold the endpoint as "online" for up to ~60s after a
+# previous (non-graceful) shutdown. Retry start with backoff so we ride
+# through that window instead of bailing immediately on ERR_NGROK_334.
+URL=""
+for attempt in 1 2 3 4 5; do
+  start_ngrok
+  if URL=$(wait_for_tunnel); then
+    break
+  fi
+  if grep -q "ERR_NGROK_334\|already online" "$NGROK_LOG" 2>/dev/null; then
+    wait_secs=$((attempt * 10))
+    echo "[!] ngrok endpoint still held by previous session (attempt $attempt/5); waiting ${wait_secs}s..."
+    pkill -f "$NGROK_BIN http" 2>/dev/null || true
+    sleep "$wait_secs"
+  else
+    break
+  fi
+done
+[[ -z "$URL" ]] && {
   echo "[ERROR] Tunnel did not start. Check $NGROK_LOG"
   cat "$NGROK_LOG" 2>/dev/null || true
   exit 1
