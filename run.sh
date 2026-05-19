@@ -39,12 +39,6 @@ fi
 PROXY_PORT="${PROXY_PORT:-8080}"
 export PROXY_API_KEY PROXY_PORT INTERNAL_API_KEY="${INTERNAL_API_KEY:-skills-network}"
 
-# Opcional: NGROK_API_KEY (https://dashboard.ngrok.com/api-keys) — distinto al
-# authtoken. Si está definido, podemos matar sesiones agente / endpoints que
-# estén activos en la cuenta desde OTRA máquina, sin esperar los ~60s de
-# heartbeat. Si no está, caemos al reclaim local de siempre.
-NGROK_API_KEY="${NGROK_API_KEY:-}"
-
 # --- Install ngrok if missing ---
 if [[ ! -x "$NGROK_BIN" ]]; then
   echo "[*] ngrok not found, downloading..."
@@ -83,123 +77,6 @@ cleanup() {
   pkill -f "$NGROK_BIN http" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
-
-# Kill any previous proxy.py / ngrok left running by an earlier shell so
-# that a fresh `run.sh` in a new terminal doesn't collide on the port or
-# trip ngrok limits. proxy.py already reclaims its own port; this also
-# covers ngrok which the proxy can't touch.
-#
-# ngrok specifically needs a *graceful* shutdown: a SIGKILL leaves the
-# endpoint published in ngrok cloud for ~60s of heartbeat timeout, and
-# the next `ngrok http` against the same authtoken fails with
-# ERR_NGROK_334 ("endpoint already online"). We send SIGTERM, wait for
-# the process to actually exit (up to NGROK_GRACE seconds), then ping
-# the local agent API as a fallback to force-disconnect from cloud.
-NGROK_GRACE="${NGROK_GRACE:-8}"
-
-# Mata todo lo que la cuenta tenga activo en ngrok cloud usando la API HTTPS.
-# Funciona aunque la sesión venga de otra máquina: detiene tunnel_sessions
-# y borra endpoints colgados. Cuando esto corre, el endpoint queda libre
-# casi al instante, sin esperar el heartbeat de ~60s.
-cloud_kill() {
-  [[ -z "$NGROK_API_KEY" ]] && return 0
-  echo "[*] Matando sesiones/endpoints remotos vía ngrok API cloud..."
-
-  # 1) Stop de tunnel_sessions activas (agentes conectados).
-  local sessions
-  sessions=$(curl -sf --max-time 5 \
-    -H "Authorization: Bearer $NGROK_API_KEY" \
-    -H "Ngrok-Version: 2" \
-    https://api.ngrok.com/tunnel_sessions 2>/dev/null \
-    | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    for s in d.get('tunnel_sessions', []) or []:
-        print(s.get('id',''))
-except Exception:
-    pass
-" 2>/dev/null) || sessions=""
-
-  for sid in $sessions; do
-    [[ -z "$sid" ]] && continue
-    # OJO: ngrok exige Content-Type y body en POSTs incluso vacíos
-    # (sin esto devuelve 415 ERR_NGROK_216).
-    if curl -sf --max-time 5 -X POST \
-        -H "Authorization: Bearer $NGROK_API_KEY" \
-        -H "Ngrok-Version: 2" \
-        -H "Content-Type: application/json" \
-        -d '{}' \
-        "https://api.ngrok.com/tunnel_sessions/$sid/stop" > /dev/null 2>&1; then
-      echo "[*]   tunnel_session $sid → stop"
-    else
-      echo "[!]   tunnel_session $sid no se pudo detener"
-    fi
-  done
-
-  # 2) Borrar endpoints residuales (a veces el endpoint sigue listado
-  #    aunque la sesión ya esté caída, sobre todo con free tier).
-  local endpoints
-  endpoints=$(curl -sf --max-time 5 \
-    -H "Authorization: Bearer $NGROK_API_KEY" \
-    -H "Ngrok-Version: 2" \
-    https://api.ngrok.com/endpoints 2>/dev/null \
-    | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    for e in d.get('endpoints', []) or []:
-        print(e.get('id',''))
-except Exception:
-    pass
-" 2>/dev/null) || endpoints=""
-
-  for eid in $endpoints; do
-    [[ -z "$eid" ]] && continue
-    if curl -sf --max-time 5 -X DELETE \
-        -H "Authorization: Bearer $NGROK_API_KEY" \
-        -H "Ngrok-Version: 2" \
-        "https://api.ngrok.com/endpoints/$eid" > /dev/null 2>&1; then
-      echo "[*]   endpoint $eid → deleted"
-    fi
-  done
-}
-
-reclaim_previous() {
-  # Proxy is cheap to kill — port reclaim in proxy.py covers stragglers.
-  if pgrep -f "$ROOT/proxy.py" > /dev/null 2>&1; then
-    pkill -f "$ROOT/proxy.py" 2>/dev/null || true
-    sleep 0.3
-    pkill -9 -f "$ROOT/proxy.py" 2>/dev/null || true
-  fi
-
-  # Si tenemos API key, primero limpiamos lo que esté activo en la cuenta
-  # (sirve incluso si el túnel previo vive en OTRA máquina).
-  cloud_kill
-
-  # ngrok needs the graceful path.
-  if pgrep -f "$NGROK_BIN http" > /dev/null 2>&1; then
-    echo "[*] Existing ngrok session found; asking it to disconnect cleanly..."
-    # Try the local agent API first — this is the cleanest path because
-    # ngrok sends a proper goodbye to the cloud and the endpoint frees
-    # almost immediately.
-    curl -sf --max-time 2 -X DELETE http://127.0.0.1:4040/api/tunnels > /dev/null 2>&1 || true
-    pkill -TERM -f "$NGROK_BIN http" 2>/dev/null || true
-    # Wait up to NGROK_GRACE seconds for the process to actually exit.
-    for _ in $(seq 1 "$NGROK_GRACE"); do
-      pgrep -f "$NGROK_BIN http" > /dev/null 2>&1 || break
-      sleep 1
-    done
-    # If it's still stuck, force it.
-    if pgrep -f "$NGROK_BIN http" > /dev/null 2>&1; then
-      echo "[!] ngrok did not exit gracefully; sending SIGKILL"
-      pkill -9 -f "$NGROK_BIN http" 2>/dev/null || true
-    fi
-  fi
-
-  # Stale PID files would confuse is_alive() in the watch loop.
-  rm -f "$PROXY_PID_FILE" "$NGROK_PID_FILE"
-}
 
 start_proxy() {
   python3 "$ROOT/proxy.py" &
@@ -278,7 +155,6 @@ EOF
 }
 
 # --- Boot ---
-reclaim_previous
 echo "[*] Starting proxy..."
 start_proxy
 if ! wait_for_proxy; then
@@ -288,39 +164,8 @@ fi
 echo "[*] Proxy ready."
 
 echo "[*] Starting ngrok tunnel..."
-# Con NGROK_API_KEY: si el otro agente está vivo, va a reconectar al
-# instante después de cada stop. Necesitamos ganar esa carrera, así que
-# hacemos muchos intentos rápidos sin esperar nada (cloud_kill → start
-# → si pierde, otra vuelta). Sin API key, caemos al backoff lineal
-# tradicional para aguantar el heartbeat de ~60s.
-if [[ -n "$NGROK_API_KEY" ]]; then
-  MAX_ATTEMPTS=20
-else
-  MAX_ATTEMPTS=5
-fi
-URL=""
-for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
-  start_ngrok
-  if URL=$(wait_for_tunnel); then
-    break
-  fi
-  if grep -q "ERR_NGROK_334\|already online\|ERR_NGROK_108\|simultaneous" "$NGROK_LOG" 2>/dev/null; then
-    echo "[!] ngrok endpoint ocupado (intento $attempt/$MAX_ATTEMPTS)."
-    pkill -f "$NGROK_BIN http" 2>/dev/null || true
-    if [[ -n "$NGROK_API_KEY" ]]; then
-      # Carrera: matar la sesión remota y reintentar inmediatamente
-      # antes de que el otro agente vuelva a registrarse.
-      cloud_kill
-    else
-      wait_secs=$((attempt * 10))
-      echo "[!] sin NGROK_API_KEY; esperando ${wait_secs}s al heartbeat de ngrok..."
-      sleep "$wait_secs"
-    fi
-  else
-    break
-  fi
-done
-[[ -z "$URL" ]] && {
+start_ngrok
+URL=$(wait_for_tunnel) || {
   echo "[ERROR] Tunnel did not start. Check $NGROK_LOG"
   cat "$NGROK_LOG" 2>/dev/null || true
   exit 1
