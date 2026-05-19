@@ -123,9 +123,13 @@ except Exception:
 
   for sid in $sessions; do
     [[ -z "$sid" ]] && continue
+    # OJO: ngrok exige Content-Type y body en POSTs incluso vacíos
+    # (sin esto devuelve 415 ERR_NGROK_216).
     if curl -sf --max-time 5 -X POST \
         -H "Authorization: Bearer $NGROK_API_KEY" \
         -H "Ngrok-Version: 2" \
+        -H "Content-Type: application/json" \
+        -d '{}' \
         "https://api.ngrok.com/tunnel_sessions/$sid/stop" > /dev/null 2>&1; then
       echo "[*]   tunnel_session $sid → stop"
     else
@@ -284,23 +288,29 @@ fi
 echo "[*] Proxy ready."
 
 echo "[*] Starting ngrok tunnel..."
-# ngrok cloud can hold the endpoint as "online" for up to ~60s after a
-# previous (non-graceful) shutdown. Retry start with backoff so we ride
-# through that window instead of bailing immediately on ERR_NGROK_334.
+# Con NGROK_API_KEY: si el otro agente está vivo, va a reconectar al
+# instante después de cada stop. Necesitamos ganar esa carrera, así que
+# hacemos muchos intentos rápidos sin esperar nada (cloud_kill → start
+# → si pierde, otra vuelta). Sin API key, caemos al backoff lineal
+# tradicional para aguantar el heartbeat de ~60s.
+if [[ -n "$NGROK_API_KEY" ]]; then
+  MAX_ATTEMPTS=20
+else
+  MAX_ATTEMPTS=5
+fi
 URL=""
-for attempt in 1 2 3 4 5; do
+for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
   start_ngrok
   if URL=$(wait_for_tunnel); then
     break
   fi
   if grep -q "ERR_NGROK_334\|already online\|ERR_NGROK_108\|simultaneous" "$NGROK_LOG" 2>/dev/null; then
-    echo "[!] ngrok endpoint aún ocupado (intento $attempt/5)."
+    echo "[!] ngrok endpoint ocupado (intento $attempt/$MAX_ATTEMPTS)."
     pkill -f "$NGROK_BIN http" 2>/dev/null || true
     if [[ -n "$NGROK_API_KEY" ]]; then
-      # Con API key intentamos el desalojo remoto al instante en vez
-      # de esperar el heartbeat de ~60s.
+      # Carrera: matar la sesión remota y reintentar inmediatamente
+      # antes de que el otro agente vuelva a registrarse.
       cloud_kill
-      sleep 2
     else
       wait_secs=$((attempt * 10))
       echo "[!] sin NGROK_API_KEY; esperando ${wait_secs}s al heartbeat de ngrok..."
