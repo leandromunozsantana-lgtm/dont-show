@@ -39,6 +39,12 @@ fi
 PROXY_PORT="${PROXY_PORT:-8080}"
 export PROXY_API_KEY PROXY_PORT INTERNAL_API_KEY="${INTERNAL_API_KEY:-skills-network}"
 
+# Opcional: NGROK_API_KEY (https://dashboard.ngrok.com/api-keys) — distinto al
+# authtoken. Si está definido, podemos matar sesiones agente / endpoints que
+# estén activos en la cuenta desde OTRA máquina, sin esperar los ~60s de
+# heartbeat. Si no está, caemos al reclaim local de siempre.
+NGROK_API_KEY="${NGROK_API_KEY:-}"
+
 # --- Install ngrok if missing ---
 if [[ ! -x "$NGROK_BIN" ]]; then
   echo "[*] ngrok not found, downloading..."
@@ -91,6 +97,70 @@ trap cleanup EXIT INT TERM
 # the local agent API as a fallback to force-disconnect from cloud.
 NGROK_GRACE="${NGROK_GRACE:-8}"
 
+# Mata todo lo que la cuenta tenga activo en ngrok cloud usando la API HTTPS.
+# Funciona aunque la sesión venga de otra máquina: detiene tunnel_sessions
+# y borra endpoints colgados. Cuando esto corre, el endpoint queda libre
+# casi al instante, sin esperar el heartbeat de ~60s.
+cloud_kill() {
+  [[ -z "$NGROK_API_KEY" ]] && return 0
+  echo "[*] Matando sesiones/endpoints remotos vía ngrok API cloud..."
+
+  # 1) Stop de tunnel_sessions activas (agentes conectados).
+  local sessions
+  sessions=$(curl -sf --max-time 5 \
+    -H "Authorization: Bearer $NGROK_API_KEY" \
+    -H "Ngrok-Version: 2" \
+    https://api.ngrok.com/tunnel_sessions 2>/dev/null \
+    | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    for s in d.get('tunnel_sessions', []) or []:
+        print(s.get('id',''))
+except Exception:
+    pass
+" 2>/dev/null) || sessions=""
+
+  for sid in $sessions; do
+    [[ -z "$sid" ]] && continue
+    if curl -sf --max-time 5 -X POST \
+        -H "Authorization: Bearer $NGROK_API_KEY" \
+        -H "Ngrok-Version: 2" \
+        "https://api.ngrok.com/tunnel_sessions/$sid/stop" > /dev/null 2>&1; then
+      echo "[*]   tunnel_session $sid → stop"
+    else
+      echo "[!]   tunnel_session $sid no se pudo detener"
+    fi
+  done
+
+  # 2) Borrar endpoints residuales (a veces el endpoint sigue listado
+  #    aunque la sesión ya esté caída, sobre todo con free tier).
+  local endpoints
+  endpoints=$(curl -sf --max-time 5 \
+    -H "Authorization: Bearer $NGROK_API_KEY" \
+    -H "Ngrok-Version: 2" \
+    https://api.ngrok.com/endpoints 2>/dev/null \
+    | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    for e in d.get('endpoints', []) or []:
+        print(e.get('id',''))
+except Exception:
+    pass
+" 2>/dev/null) || endpoints=""
+
+  for eid in $endpoints; do
+    [[ -z "$eid" ]] && continue
+    if curl -sf --max-time 5 -X DELETE \
+        -H "Authorization: Bearer $NGROK_API_KEY" \
+        -H "Ngrok-Version: 2" \
+        "https://api.ngrok.com/endpoints/$eid" > /dev/null 2>&1; then
+      echo "[*]   endpoint $eid → deleted"
+    fi
+  done
+}
+
 reclaim_previous() {
   # Proxy is cheap to kill — port reclaim in proxy.py covers stragglers.
   if pgrep -f "$ROOT/proxy.py" > /dev/null 2>&1; then
@@ -98,6 +168,10 @@ reclaim_previous() {
     sleep 0.3
     pkill -9 -f "$ROOT/proxy.py" 2>/dev/null || true
   fi
+
+  # Si tenemos API key, primero limpiamos lo que esté activo en la cuenta
+  # (sirve incluso si el túnel previo vive en OTRA máquina).
+  cloud_kill
 
   # ngrok needs the graceful path.
   if pgrep -f "$NGROK_BIN http" > /dev/null 2>&1; then
@@ -219,11 +293,19 @@ for attempt in 1 2 3 4 5; do
   if URL=$(wait_for_tunnel); then
     break
   fi
-  if grep -q "ERR_NGROK_334\|already online" "$NGROK_LOG" 2>/dev/null; then
-    wait_secs=$((attempt * 10))
-    echo "[!] ngrok endpoint still held by previous session (attempt $attempt/5); waiting ${wait_secs}s..."
+  if grep -q "ERR_NGROK_334\|already online\|ERR_NGROK_108\|simultaneous" "$NGROK_LOG" 2>/dev/null; then
+    echo "[!] ngrok endpoint aún ocupado (intento $attempt/5)."
     pkill -f "$NGROK_BIN http" 2>/dev/null || true
-    sleep "$wait_secs"
+    if [[ -n "$NGROK_API_KEY" ]]; then
+      # Con API key intentamos el desalojo remoto al instante en vez
+      # de esperar el heartbeat de ~60s.
+      cloud_kill
+      sleep 2
+    else
+      wait_secs=$((attempt * 10))
+      echo "[!] sin NGROK_API_KEY; esperando ${wait_secs}s al heartbeat de ngrok..."
+      sleep "$wait_secs"
+    fi
   else
     break
   fi
